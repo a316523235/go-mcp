@@ -1,0 +1,2 @@
+# go-mcp
+auto task
