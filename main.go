@@ -1,132 +1,346 @@
-//go:build go1.16
-// +build go1.16
-
 package main
 
 import (
-	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
+	_ "github.com/go-sql-driver/mysql" // MySQL驱动，确认你的版本是否支持1.7
+	"io"
+	"log"
 	"os"
+	"xorm.io/xorm"
 )
 
-// MCP 协议结构
-type JsonRpcReq struct {
-	Jsonrpc string      `json:"jsonrpc"`
-	ID      interface{} `json:"id"`
-	Method  string      `json:"method"`
-	Params  interface{} `json:"params,omitempty"`
+// JSON-RPC 2.0 消息结构
+type JSONRPCRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
+	ID      interface{}     `json:"id"`
 }
 
-type JsonRpcResp struct {
-	Jsonrpc string      `json:"jsonrpc"`
-	ID      interface{} `json:"id"`
+type JSONRPCResponse struct {
+	JSONRPC string      `json:"jsonrpc"`
 	Result  interface{} `json:"result,omitempty"`
-	Error   *RpcError   `json:"error,omitempty"`
+	Error   *RPCError   `json:"error,omitempty"`
+	ID      interface{} `json:"id"`
 }
 
-type RpcError struct {
+type RPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-type AddArgs struct {
-	A int `json:"a"`
-	B int `json:"b"`
+// 工具定义
+type Tool struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	InputSchema interface{} `json:"inputSchema"`
 }
 
-// 工具实现
-func add(args AddArgs) interface{} {
-	return map[string]interface{}{
-		"content": []map[string]string{
-			{"type": "text", "text": fmt.Sprintf("%d", args.A+args.B)},
-		},
-	}
+// 初始化响应结构
+type InitializeResult struct {
+	ProtocolVersion string                 `json:"protocolVersion"`
+	Capabilities    map[string]interface{} `json:"capabilities"`
+	ServerInfo      struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	} `json:"serverInfo"`
+}
+
+// 工具列表响应
+type ToolsListResult struct {
+	Tools []Tool `json:"tools"`
+}
+
+// 查询参数
+type QueryArgs struct {
+	SQL string `json:"sql"`
 }
 
 func main() {
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
+	var dsn string
+	flag.StringVar(&dsn, "dsn", "", "MySQL DSN (either standard format or mysql:// URL)")
+	flag.Parse()
+	if dsn == "" {
+		// 从环境变量读取数据库连接
+		dsn = os.Getenv("dsn")
+	}
+
+	if dsn == "" {
+		log.Fatal("dsn environment variable not set")
+	}
+
+	// 循环读取标准输入
+	decoder := json.NewDecoder(os.Stdin)
+	for {
+		var req JSONRPCRequest
+		if err := decoder.Decode(&req); err != nil {
+			if err == io.EOF {
+				break
+			}
+			// 忽略空行或无效输入
 			continue
 		}
-		var req JsonRpcReq
-		if err := json.Unmarshal(line, &req); err != nil {
-			continue // 非 JSON 忽略
-		}
 
-		// 处理初始化握手请求
-		if req.Method == "initialize" {
-			resp := JsonRpcResp{
-				Jsonrpc: "2.0",
-				ID:      req.ID,
-				Result: map[string]interface{}{
-					"capabilities": map[string]interface{}{
-						"tools": map[string]interface{}{
-							"listChanged": true,
-						},
+		// 处理请求
+		response := handleRequest(req, dsn)
+
+		// 发送响应
+		if err := json.NewEncoder(os.Stdout).Encode(response); err != nil {
+			log.Printf("Failed to encode response: %v", err)
+		}
+	}
+}
+
+func handleRequest(req JSONRPCRequest, dsn string) JSONRPCResponse {
+	switch req.Method {
+	case "initialize":
+		return handleInitialize(req)
+	case "tools/list":
+		return handleToolsList(req)
+	case "tools/call":
+		return handleToolsCall(req, dsn)
+	default:
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32601,
+				Message: "Method not found",
+			},
+			ID: req.ID,
+		}
+	}
+}
+
+func handleInitialize(req JSONRPCRequest) JSONRPCResponse {
+	// 解析初始化参数（如果需要）
+
+	result := InitializeResult{
+		ProtocolVersion: "2024-11-05",
+		Capabilities: map[string]interface{}{
+			"tools": map[string]bool{
+				"listChanged": false,
+			},
+		},
+	}
+	result.ServerInfo.Name = "mysql-mcp"
+	result.ServerInfo.Version = "1.0.0"
+
+	return JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result:  result,
+		ID:      req.ID,
+	}
+}
+
+func handleToolsList(req JSONRPCRequest) JSONRPCResponse {
+	tools := []Tool{
+		{
+			Name:        "query_mysql",
+			Description: "执行SQL查询并返回结果",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"sql": map[string]string{
+						"type":        "string",
+						"description": "要执行的SQL语句",
 					},
 				},
-			}
-			_ = json.NewEncoder(os.Stdout).Encode(resp)
-			os.Stdout.Sync()
-		} else if req.Method == "$/cancelRequest" || req.Method == "textDocument/didOpen" {
-			// 对于其他标准MCP消息，发送空响应
-			resp := JsonRpcResp{
-				Jsonrpc: "2.0",
-				ID:      req.ID,
-			}
-			_ = json.NewEncoder(os.Stdout).Encode(resp)
-			os.Stdout.Sync()
-		} else if req.Method == "tools/list" {
-			// 响应工具列表请求
-			toolsList := []map[string]interface{}{
-				{
-					"name":        "add",
-					"description": "Add two numbers",
-					"inputSchema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"a": map[string]interface{}{"type": "integer", "description": "First number"},
-							"b": map[string]interface{}{"type": "integer", "description": "Second number"},
-						},
-						"required": []string{"a", "b"},
-					},
-				},
-			}
-			resp := JsonRpcResp{
-				Jsonrpc: "2.0",
-				ID:      req.ID,
-				Result: map[string]interface{}{
-					"tools": toolsList,
-				},
-			}
-			_ = json.NewEncoder(os.Stdout).Encode(resp)
-			os.Stdout.Sync()
-		} else if req.Method == "tools/call" {
-			// 处理工具调用请求
-			var addArgs AddArgs
-			if paramsMap, ok := req.Params.(map[string]interface{}); ok {
-				if arguments, ok := paramsMap["arguments"].(map[string]interface{}); ok {
-					if a, ok := arguments["a"].(float64); ok {
-						addArgs.A = int(a)
-					}
-					if b, ok := arguments["b"].(float64); ok {
-						addArgs.B = int(b)
-					}
-				}
-			}
+				"required": []string{"sql"},
+			},
+		},
+	}
 
-			if addArgs.A != 0 || addArgs.B != 0 { // 检查是否有有效的参数
-				resp := JsonRpcResp{
-					Jsonrpc: "2.0",
-					ID:      req.ID,
-					Result:  add(addArgs),
-				}
-				_ = json.NewEncoder(os.Stdout).Encode(resp)
-				os.Stdout.Sync()
+	return JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result: ToolsListResult{
+			Tools: tools,
+		},
+		ID: req.ID,
+	}
+}
+
+func handleToolsCall(req JSONRPCRequest, dsn string) JSONRPCResponse {
+	// 解析调用参数
+	var params struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32602,
+				Message: "Invalid params: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+
+	if params.Name != "query_mysql" {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32601,
+				Message: "Tool not found: " + params.Name,
+			},
+			ID: req.ID,
+		}
+	}
+
+	// 解析参数
+	var args QueryArgs
+	if err := json.Unmarshal(params.Arguments, &args); err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32602,
+				Message: "Invalid arguments: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+
+	v := struct {
+		User   string `json:"user"`
+		Passwd string `json:"passwd"`
+		IP     string `json:"ip"`
+		Port   string `json:"port"`
+		Dbname string `json:"dbname"`
+	}{
+		User:   "chenhanqun",
+		Passwd: "z4DQsZTXLPdGddWzRP6SZuK3CeOEIb",
+		IP:     "test-ad.mysql.meiyoudb.com",
+		Port:   "33088",
+		Dbname: "my_ad_activity",
+	}
+
+	// 执行SQL查询
+	dataSourceName := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&loc=Local",
+		v.User,
+		v.Passwd,
+		v.IP,
+		v.Port,
+		v.Dbname)
+
+	engine, err1 := xorm.NewEngine("mysql", dataSourceName)
+	if err1 != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Database xorm connection failed: " + err1.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+	defer engine.Close()
+	// ping 会输出信息，输出信息会打印在控制台，隐藏掉
+	//err1 = engine.Ping()
+	//if err1 != nil {
+	//	return JSONRPCResponse{
+	//		JSONRPC: "2.0",
+	//		Error: &RPCError{
+	//			Code:    -32000,
+	//			Message: "Database xorm ping failed: " + err1.Error(),
+	//		},
+	//		ID: req.ID,
+	//	}
+	//}
+
+	db := engine.DB()
+
+	// 原始初始化链接mysql
+	//db, err := sql.Open("mysql", dsn)
+	//if err != nil {
+	//	return JSONRPCResponse{
+	//		JSONRPC: "2.0",
+	//		Error: &RPCError{
+	//			Code:    -32000,
+	//			Message: "Database connection failed: " + err.Error(),
+	//		},
+	//		ID: req.ID,
+	//	}
+	//}
+	//defer db.Close()
+
+	// 执行SQL查询
+	rows, err := db.Query(args.SQL)
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Query failed: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+	defer rows.Close()
+
+	// 获取列名
+	columns, err := rows.Columns()
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Failed to get columns: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+
+	// 构建结果
+	results := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		// 创建扫描目标
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return JSONRPCResponse{
+				JSONRPC: "2.0",
+				Error: &RPCError{
+					Code:    -32000,
+					Message: "Row scan failed: " + err.Error(),
+				},
+				ID: req.ID,
 			}
 		}
+
+		row := make(map[string]interface{})
+		for i, col := range columns {
+			// 处理 []byte 类型，转为字符串
+			if b, ok := values[i].([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = values[i]
+			}
+		}
+		results = append(results, row)
+	}
+
+	// 转换为MCP要求的格式
+	resultJSON, _ := json.Marshal(results)
+
+	response := map[string]interface{}{
+		"content": []map[string]interface{}{
+			{
+				"type": "text",
+				"text": string(resultJSON),
+			},
+		},
+	}
+
+	return JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result:  response,
+		ID:      req.ID,
 	}
 }

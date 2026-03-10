@@ -26,3 +26,18 @@ go-mcp
   }
 }
 ```
+
+### 本地测试
+```shell
+## 编译
+go install
+
+
+
+## 输入
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_mysql","arguments":{"sql":"SELECT 1 as test"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_mysql","arguments":{"sql":"SELECT * FROM dtc_payment WHERE STATUS=3"}}}
+
+## 输出
+## {"jsonrpc":"2.0","result":{"content":[{"text":"[{\"test\":\"1\"}]","type":"text"}]},"id":3}
+```
