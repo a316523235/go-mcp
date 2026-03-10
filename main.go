@@ -1,14 +1,13 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"flag"
-	"fmt"
 	_ "github.com/go-sql-driver/mysql" // MySQL驱动，确认你的版本是否支持1.7
 	"io"
 	"log"
 	"os"
-	"xorm.io/xorm"
 )
 
 // JSON-RPC 2.0 消息结构
@@ -56,6 +55,15 @@ type ToolsListResult struct {
 // 查询参数
 type QueryArgs struct {
 	SQL string `json:"sql"`
+}
+
+// 列出表参数
+type ListTablesArgs struct {
+	Database string `json:"database"`
+}
+
+// 列出数据库参数（无参数，留空）
+type ListDatabasesArgs struct {
 }
 
 func main() {
@@ -150,6 +158,29 @@ func handleToolsList(req JSONRPCRequest) JSONRPCResponse {
 				"required": []string{"sql"},
 			},
 		},
+		{
+			Name:        "list_databases",
+			Description: "列出MySQL实例中的所有数据库",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+				"required":   []string{},
+			},
+		},
+		{
+			Name:        "list_tables",
+			Description: "列出指定数据库中的所有表",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"database": map[string]string{
+						"type":        "string",
+						"description": "数据库名称",
+					},
+				},
+				"required": []string{"database"},
+			},
+		},
 	}
 
 	return JSONRPCResponse{
@@ -179,7 +210,15 @@ func handleToolsCall(req JSONRPCRequest, dsn string) JSONRPCResponse {
 		}
 	}
 
-	if params.Name != "query_mysql" {
+	// 根据工具名称分派处理
+	switch params.Name {
+	case "query_mysql":
+		return handleQueryMySQL(req, dsn, params.Arguments)
+	case "list_databases":
+		return handleListDatabases(req, dsn)
+	case "list_tables":
+		return handleListTables(req, dsn, params.Arguments)
+	default:
 		return JSONRPCResponse{
 			JSONRPC: "2.0",
 			Error: &RPCError{
@@ -189,10 +228,12 @@ func handleToolsCall(req JSONRPCRequest, dsn string) JSONRPCResponse {
 			ID: req.ID,
 		}
 	}
+}
 
+func handleQueryMySQL(req JSONRPCRequest, dsn string, arguments json.RawMessage) JSONRPCResponse {
 	// 解析参数
 	var args QueryArgs
-	if err := json.Unmarshal(params.Arguments, &args); err != nil {
+	if err := json.Unmarshal(arguments, &args); err != nil {
 		return JSONRPCResponse{
 			JSONRPC: "2.0",
 			Error: &RPCError{
@@ -203,71 +244,223 @@ func handleToolsCall(req JSONRPCRequest, dsn string) JSONRPCResponse {
 		}
 	}
 
-	v := struct {
-		User   string `json:"user"`
-		Passwd string `json:"passwd"`
-		IP     string `json:"ip"`
-		Port   string `json:"port"`
-		Dbname string `json:"dbname"`
-	}{
-		User:   "chenhanqun",
-		Passwd: "z4DQsZTXLPdGddWzRP6SZuK3CeOEIb",
-		IP:     "test-ad.mysql.meiyoudb.com",
-		Port:   "33088",
-		Dbname: "my_ad_activity",
-	}
-
-	// 执行SQL查询
-	dataSourceName := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&loc=Local",
-		v.User,
-		v.Passwd,
-		v.IP,
-		v.Port,
-		v.Dbname)
-
-	engine, err1 := xorm.NewEngine("mysql", dataSourceName)
-	if err1 != nil {
+	// 使用传入的dsn建立数据库连接
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
 		return JSONRPCResponse{
 			JSONRPC: "2.0",
 			Error: &RPCError{
 				Code:    -32000,
-				Message: "Database xorm connection failed: " + err1.Error(),
+				Message: "Database connection failed: " + err.Error(),
 			},
 			ID: req.ID,
 		}
 	}
-	defer engine.Close()
-	// ping 会输出信息，输出信息会打印在控制台，隐藏掉
-	//err1 = engine.Ping()
-	//if err1 != nil {
-	//	return JSONRPCResponse{
-	//		JSONRPC: "2.0",
-	//		Error: &RPCError{
-	//			Code:    -32000,
-	//			Message: "Database xorm ping failed: " + err1.Error(),
-	//		},
-	//		ID: req.ID,
-	//	}
-	//}
-
-	db := engine.DB()
-
-	// 原始初始化链接mysql
-	//db, err := sql.Open("mysql", dsn)
-	//if err != nil {
-	//	return JSONRPCResponse{
-	//		JSONRPC: "2.0",
-	//		Error: &RPCError{
-	//			Code:    -32000,
-	//			Message: "Database connection failed: " + err.Error(),
-	//		},
-	//		ID: req.ID,
-	//	}
-	//}
-	//defer db.Close()
+	defer db.Close()
 
 	// 执行SQL查询
 	rows, err := db.Query(args.SQL)
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Query failed: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+	defer rows.Close()
+
+	// 获取列名
+	columns, err := rows.Columns()
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Failed to get columns: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+
+	// 构建结果
+	results := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		// 创建扫描目标
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return JSONRPCResponse{
+				JSONRPC: "2.0",
+				Error: &RPCError{
+					Code:    -32000,
+					Message: "Row scan failed: " + err.Error(),
+				},
+				ID: req.ID,
+			}
+		}
+
+		row := make(map[string]interface{})
+		for i, col := range columns {
+			// 处理 []byte 类型，转为字符串
+			if b, ok := values[i].([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = values[i]
+			}
+		}
+		results = append(results, row)
+	}
+
+	// 转换为MCP要求的格式
+	resultJSON, _ := json.Marshal(results)
+
+	response := map[string]interface{}{
+		"content": []map[string]interface{}{
+			{
+				"type": "text",
+				"text": string(resultJSON),
+			},
+		},
+	}
+
+	return JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result:  response,
+		ID:      req.ID,
+	}
+}
+
+func handleListDatabases(req JSONRPCRequest, dsn string) JSONRPCResponse {
+	// 使用传入的dsn建立数据库连接
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Database connection failed: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+	defer db.Close()
+
+	// 执行SHOW DATABASES查询
+	rows, err := db.Query("SHOW DATABASES")
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Query failed: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+	defer rows.Close()
+
+	// 获取列名
+	columns, err := rows.Columns()
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Failed to get columns: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+
+	// 构建结果
+	results := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		// 创建扫描目标
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return JSONRPCResponse{
+				JSONRPC: "2.0",
+				Error: &RPCError{
+					Code:    -32000,
+					Message: "Row scan failed: " + err.Error(),
+				},
+				ID: req.ID,
+			}
+		}
+
+		row := make(map[string]interface{})
+		for i, col := range columns {
+			// 处理 []byte 类型，转为字符串
+			if b, ok := values[i].([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = values[i]
+			}
+		}
+		results = append(results, row)
+	}
+
+	// 转换为MCP要求的格式
+	resultJSON, _ := json.Marshal(results)
+
+	response := map[string]interface{}{
+		"content": []map[string]interface{}{
+			{
+				"type": "text",
+				"text": string(resultJSON),
+			},
+		},
+	}
+
+	return JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result:  response,
+		ID:      req.ID,
+	}
+}
+
+func handleListTables(req JSONRPCRequest, dsn string, arguments json.RawMessage) JSONRPCResponse {
+	// 解析参数
+	var args ListTablesArgs
+	if err := json.Unmarshal(arguments, &args); err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32602,
+				Message: "Invalid arguments: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+
+	// 使用传入的dsn建立数据库连接
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Database connection failed: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+	defer db.Close()
+
+	// 执行SHOW TABLES查询
+	rows, err := db.Query("SHOW TABLES FROM ?", args.Database)
 	if err != nil {
 		return JSONRPCResponse{
 			JSONRPC: "2.0",

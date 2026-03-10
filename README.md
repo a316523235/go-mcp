@@ -32,7 +32,8 @@ go-mcp
 ## 编译
 go install
 
-
+## 测试运行
+go-mcp --dsn "账户:密码@tcp(test-ad.mysql.meiyoudb.com:端口)/my_ad_activity?parseTime=true&loc=Local"              
 
 ## 输入
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_mysql","arguments":{"sql":"SELECT 1 as test"}}}
