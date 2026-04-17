@@ -4,10 +4,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"flag"
+	"fmt"
 	_ "github.com/go-sql-driver/mysql" // MySQL驱动，确认你的版本是否支持1.7
 	"io"
 	"log"
 	"os"
+	"regexp"
 )
 
 // JSON-RPC 2.0 消息结构
@@ -64,6 +66,12 @@ type ListTablesArgs struct {
 
 // 列出数据库参数（无参数，留空）
 type ListDatabasesArgs struct {
+}
+
+// 查看表结构参数
+type DescribeTableArgs struct {
+	Database string `json:"database"`
+	Table    string `json:"table"`
 }
 
 func main() {
@@ -181,6 +189,24 @@ func handleToolsList(req JSONRPCRequest) JSONRPCResponse {
 				"required": []string{"database"},
 			},
 		},
+		{
+			Name:        "describe_table",
+			Description: "查看指定表的结构（字段、类型、索引等信息）",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"table": map[string]string{
+						"type":        "string",
+						"description": "表名称",
+					},
+					"database": map[string]string{
+						"type":        "string",
+						"description": "数据库名称（可选，不填则使用当前连接的数据库）",
+					},
+				},
+				"required": []string{"table"},
+			},
+		},
 	}
 
 	return JSONRPCResponse{
@@ -218,6 +244,8 @@ func handleToolsCall(req JSONRPCRequest, dsn string) JSONRPCResponse {
 		return handleListDatabases(req, dsn)
 	case "list_tables":
 		return handleListTables(req, dsn, params.Arguments)
+	case "describe_table":
+		return handleDescribeTable(req, dsn, params.Arguments)
 	default:
 		return JSONRPCResponse{
 			JSONRPC: "2.0",
@@ -459,8 +487,20 @@ func handleListTables(req JSONRPCRequest, dsn string, arguments json.RawMessage)
 	}
 	defer db.Close()
 
-	// 执行SHOW TABLES查询
-	rows, err := db.Query("SHOW TABLES FROM ?", args.Database)
+	// 校验数据库名称，防止SQL注入
+	if !isValidIdentifier(args.Database) {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32602,
+				Message: "Invalid database name: " + args.Database,
+			},
+			ID: req.ID,
+		}
+	}
+
+	// 执行SHOW TABLES查询（数据库名作为标识符不能用占位符）
+	rows, err := db.Query(fmt.Sprintf("SHOW TABLES FROM `%s`", args.Database))
 	if err != nil {
 		return JSONRPCResponse{
 			JSONRPC: "2.0",
@@ -510,6 +550,147 @@ func handleListTables(req JSONRPCRequest, dsn string, arguments json.RawMessage)
 		row := make(map[string]interface{})
 		for i, col := range columns {
 			// 处理 []byte 类型，转为字符串
+			if b, ok := values[i].([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = values[i]
+			}
+		}
+		results = append(results, row)
+	}
+
+	// 转换为MCP要求的格式
+	resultJSON, _ := json.Marshal(results)
+
+	response := map[string]interface{}{
+		"content": []map[string]interface{}{
+			{
+				"type": "text",
+				"text": string(resultJSON),
+			},
+		},
+	}
+
+	return JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result:  response,
+		ID:      req.ID,
+	}
+}
+
+// isValidIdentifier 校验数据库名/表名是否合法，防止SQL注入
+func isValidIdentifier(name string) bool {
+	matched, _ := regexp.MatchString(`^[a-zA-Z0-9_]+$`, name)
+	return matched
+}
+
+func handleDescribeTable(req JSONRPCRequest, dsn string, arguments json.RawMessage) JSONRPCResponse {
+	// 解析参数
+	var args DescribeTableArgs
+	if err := json.Unmarshal(arguments, &args); err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32602,
+				Message: "Invalid arguments: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+
+	// 校验表名
+	if !isValidIdentifier(args.Table) {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32602,
+				Message: "Invalid table name: " + args.Table,
+			},
+			ID: req.ID,
+		}
+	}
+
+	// 如果指定了数据库名，也校验一下
+	if args.Database != "" && !isValidIdentifier(args.Database) {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32602,
+				Message: "Invalid database name: " + args.Database,
+			},
+			ID: req.ID,
+		}
+	}
+
+	// 建立数据库连接
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Database connection failed: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+	defer db.Close()
+
+	// 构造查询语句
+	query := fmt.Sprintf("DESCRIBE `%s`", args.Table)
+	if args.Database != "" {
+		query = fmt.Sprintf("DESCRIBE `%s`.`%s`", args.Database, args.Table)
+	}
+
+	// 执行DESCRIBE查询
+	rows, err := db.Query(query)
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Query failed: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+	defer rows.Close()
+
+	// 获取列名
+	columns, err := rows.Columns()
+	if err != nil {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    -32000,
+				Message: "Failed to get columns: " + err.Error(),
+			},
+			ID: req.ID,
+		}
+	}
+
+	// 构建结果
+	results := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return JSONRPCResponse{
+				JSONRPC: "2.0",
+				Error: &RPCError{
+					Code:    -32000,
+					Message: "Row scan failed: " + err.Error(),
+				},
+				ID: req.ID,
+			}
+		}
+
+		row := make(map[string]interface{})
+		for i, col := range columns {
 			if b, ok := values[i].([]byte); ok {
 				row[col] = string(b)
 			} else {
