@@ -99,6 +99,12 @@ func main() {
 			continue
 		}
 
+		// notification（无 id）按 JSON-RPC 规范不能回响应
+		if req.ID == nil {
+			// 目前所有 notification 都直接忽略（initialized / cancelled / ping 等）
+			continue
+		}
+
 		// 处理请求
 		response := handleRequest(req, dsn)
 
